@@ -10,7 +10,7 @@ from collections import deque
 import random
 from transformers import AutoModelForVision2Seq, AutoProcessor
 from Controls import control_state, GetControlState, Cleanup, StopAllMovement
-from screenconfig import ScreenConfig
+from config.screenconfig import ScreenConfig
 from process_detector import ProcessDetector
 
 # OpenVLA Configuration

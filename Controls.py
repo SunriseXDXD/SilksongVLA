@@ -1,5 +1,5 @@
 import pyautogui
-import keyconfig
+from config import keyconfig
 import time
 import threading
 
@@ -15,7 +15,6 @@ class ControlState:
         
 control_state = ControlState()
 
-# Existing functions
 def UseUpTool():
     pyautogui.keyDown(keyconfig.UP)
     pyautogui.press(keyconfig.TOOL)
@@ -33,17 +32,19 @@ def Dash():
     pyautogui.press(keyconfig.DASH)
 
 def Hook():
+    """Hook"""
     pyautogui.press(keyconfig.HOOK)
 
 def Attack():
+    """Basic attack"""
     pyautogui.press(keyconfig.ATTACK)
     
 def DownSlash():
+    """Down slash attack"""
     pyautogui.keyDown(keyconfig.DOWN)
     pyautogui.press(keyconfig.ATTACK)
     pyautogui.keyUp(keyconfig.DOWN)
 
-# Basic movement controls with press and release functionality
 def MoveLeft():
     """Start moving left"""
     if keyconfig.LEFT not in control_state.keys_pressed:
