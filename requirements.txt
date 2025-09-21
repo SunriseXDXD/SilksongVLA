@@ -1,0 +1,49 @@
+# Core OpenVLA dependencies
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.40.1
+tokenizers>=0.19.1
+timm>=0.9.10
+
+# Process and window detection
+psutil>=5.9.0
+pywin32>=306
+# For Linux/Mac alternative: install python-xlib (Linux) or pyobjc (Mac)
+
+# Flash Attention (optional but recommended)
+flash-attn>=2.5.5
+
+# PEFT for LoRA fine-tuning
+peft>=0.4.0
+
+# Computer vision and image processing
+opencv-python>=4.8.0
+Pillow>=9.0.0
+
+# Screen capture
+pyautogui>=0.9.53
+
+# Numerical computing
+numpy>=1.21.0
+
+# Machine learning utilities
+scikit-learn>=1.0.0
+
+# Progress tracking
+tqdm>=4.62.0
+
+# Logging and monitoring
+wandb>=0.15.0
+
+# Additional utilities
+packaging>=21.0
+ninja>=1.10.0
+
+# Optional: For better performance
+accelerate>=0.20.0
+bitsandbytes>=0.37.0  # For quantization support
+
+# Development dependencies (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
