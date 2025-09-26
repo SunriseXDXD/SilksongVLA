@@ -1,8 +1,17 @@
+#!/usr/bin/env python3
+"""
+Silksong VLA Training Script with SmolVLA
+
+This script implements a Vision-Language-Action (VLA) agent for playing
+Hollow Knight: Silksong using SmolVLA as the base model with hierarchical RL.
+"""
+
+import pyautogui
 import numpy as np
 import cv2
 import time
 import threading
-from PIL import ImageGrab,Image
+from PIL import ImageGrab, Image
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,23 +22,23 @@ from Controls import control_state, GetControlState, Cleanup, StopAllMovement
 from config.screenconfig import ScreenConfig
 from process_detector import ProcessDetector
 
-# OpenVLA Configuration
-class OpenVLAConfig:
+# SmolVLA Configuration
+class SmolVLAConfig:
     def __init__(self):
-        self.model_name = "openvla/openvla-7b"  # Pretrained OpenVLA model
+        self.model_name = "HuggingFaceM4/SmolVLM-Instruct"  # SmolVLA model
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         
         # Fine-tuning parameters
         self.use_lora = True
-        self.lora_rank = 32
-        self.learning_rate = 5e-4
-        self.batch_size = 4  # Reduced for memory efficiency
-        self.grad_accumulation_steps = 4
+        self.lora_rank = 16  # Smaller rank for SmolVLA
+        self.learning_rate = 1e-4  # Lower learning rate for stability
+        self.batch_size = 2  # Smaller batch size for memory efficiency
+        self.grad_accumulation_steps = 8
         
         # Action space configuration for Silksong
         self.action_dim = 20  # Number of discrete actions
-        self.action_discretization = 256  # OpenVLA uses 256-bin discretization
+        self.action_discretization = 256  # SmolVLA uses 256-bin discretization
         
         # Training parameters
         self.max_episodes = 1000
@@ -41,10 +50,10 @@ class OpenVLAConfig:
         
         # Prompt templates for different game scenarios
         self.prompt_templates = {
-            "combat": "In: What action should the character take to defeat the enemy?",
-            "exploration": "In: What action should the character take to explore the area?",
-            "platforming": "In: What action should the character take to navigate the platform?",
-            "general": "In: What action should the character take to progress in the game?"
+            "combat": "In: What action should Hornet take to defeat the enemy? Out:",
+            "exploration": "In: What action should Hornet take to explore the area? Out:",
+            "platforming": "In: What action should Hornet take to navigate the platform? Out:",
+            "general": "In: What action should Hornet take to progress in the game? Out:"
         }
         
         # Process detection settings
@@ -53,14 +62,14 @@ class OpenVLAConfig:
         self.game_check_interval = 2.0  # Seconds between game status checks
         self.auto_restart_training = True  # Automatically restart training when game starts
 
-# OpenVLA-based RL Agent
-class OpenVLAAgent:
+# SmolVLA-based RL Agent
+class SmolVLAAgent:
     def __init__(self, config, screen_config):
         self.config = config
         self.screen_config = screen_config
         
-        # Initialize OpenVLA model and processor
-        print("Loading OpenVLA model...")
+        # Initialize SmolVLA model and processor
+        print("Loading SmolVLA model...")
         self.processor = AutoProcessor.from_pretrained(
             config.model_name, 
             trust_remote_code=True
@@ -68,10 +77,10 @@ class OpenVLAAgent:
         
         self.model = AutoModelForVision2Seq.from_pretrained(
             config.model_name,
-            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+            attn_implementation="flash_attention_1" if torch.cuda.is_available() else "eager",
             torch_dtype=config.torch_dtype,
             low_cpu_mem_usage=True,
-            trust_remote_code=True
+            trust_remote_code=True,
         ).to(config.device)
         
         # Setup LoRA if enabled
@@ -89,7 +98,7 @@ class OpenVLAAgent:
         self.episode_count = 0
         self.step_count = 0
         
-        print("OpenVLA agent initialized successfully!")
+        print("SmolVLA agent initialized successfully!")
     
     def _setup_lora(self):
         """Setup LoRA for efficient fine-tuning"""
@@ -107,171 +116,161 @@ class OpenVLAAgent:
             
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
-            print("LoRA setup completed!")
+            print("LoRA setup completed successfully!")
             
         except ImportError:
-            print("PEFT not available, continuing without LoRA")
+            print("PEFT not available, proceeding without LoRA")
             self.config.use_lora = False
     
     def _create_action_mapping(self):
-        """Create mapping between OpenVLA actions and Silksong controls"""
-        return {
-            0: "no_action",
-            1: "move_left", 
-            2: "move_right",
-            3: "move_up",
-            4: "move_down",
-            5: "jump_short",
-            6: "jump_medium",
-            7: "jump_long",
-            8: "double_jump",
-            9: "attack",
-            10: "down_slash",
-            11: "dash",
-            12: "dash_attack",
-            13: "jump_attack",
-            14: "use_tool",
-            15: "use_up_tool",
-            16: "use_down_tool",
-            17: "hook",
-            18: "bind",
-            19: "quick_map"
-        }
+        """Create mapping between SmolVLA actions and Silksong controls"""
+        # Define discrete action space
+        actions = [
+            # Movement
+            "MoveLeft", "MoveRight", "MoveUp", "MoveDown", "Dash", "Hook",
+            # Combat
+            "Attack", "DownSlash", "HoldAttack", 
+            # Tools
+            "UseUpTool", "UseMidTool", "UseDownTool",
+            # Special
+            "NoAction", "SpecialAttack"
+        ]
+        
+        return {i: action for i, action in enumerate(actions)}
     
     def get_action_prompt(self, scenario="general"):
         """Get appropriate prompt for current game scenario"""
-        base_prompt = self.config.prompt_templates.get(scenario, self.config.prompt_templates["general"])
-        return f"{base_prompt}\nOut:"
+        return self.config.prompt_templates.get(scenario, self.config.prompt_templates["general"])
     
     def preprocess_image(self, image):
-        """Preprocess image for OpenVLA input"""
-        if image is None:
-            return None
+        """Preprocess image for SmolVLA input"""
+        # Convert to PIL Image if needed
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
         
-        # Convert BGR to RGB
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Resize and preprocess
+        image = image.resize((224, 224))
         
-        # Convert to PIL Image
-        pil_image = Image.fromarray(image)
-        
-        return pil_image
+        return image
     
     def select_action(self, image, scenario="general"):
-        """Select action using OpenVLA with epsilon-greedy exploration"""
+        """Select action using SmolVLA with epsilon-greedy exploration"""
         # Epsilon-greedy exploration
         if random.random() < self.epsilon:
-            return random.randint(0, len(self.action_mapping) - 1)
+            return random.randint(0, self.config.action_dim - 1)
         
-        try:
-            # Preprocess image
-            pil_image = self.preprocess_image(image)
-            if pil_image is None:
-                return random.randint(0, len(self.action_mapping) - 1)
-            
-            # Get prompt
-            prompt = self.get_action_prompt(scenario)
-            
-            # Prepare inputs
-            inputs = self.processor(prompt, pil_image).to(
-                self.config.device, 
-                dtype=self.config.torch_dtype
+        # Preprocess image
+        processed_image = self.preprocess_image(image)
+        
+        # Get prompt
+        prompt = self.get_action_prompt(scenario)
+        
+        # Prepare inputs
+        inputs = self.processor(
+            text=prompt,
+            images=processed_image,
+            return_tensors="pt"
+        ).to(self.config.device)
+        
+        # Generate action
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=50,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=self.processor.tokenizer.eos_token_id
             )
-            
-            # Get action prediction from OpenVLA
-            with torch.no_grad():
-                # OpenVLA predicts continuous actions, we'll discretize
-                action_logits = self.model.predict_action(
-                    **inputs, 
-                    unnorm_key=None,  # We'll handle normalization ourselves
-                    do_sample=False
-                )
-                
-                # Convert continuous action to discrete
-                if isinstance(action_logits, torch.Tensor):
-                    action_logits = action_logits.cpu().numpy()
-                
-                # Simple discretization: map to action space
-                action_id = int(action_logits[0] * len(self.action_mapping)) % len(self.action_mapping)
-                
+        
+        # Decode output
+        generated_text = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+        
+        # Extract action from generated text
+        action_id = self._extract_action_from_text(generated_text)
+        
+        return action_id
+    
+    def _extract_action_from_text(self, text):
+        """Extract action ID from generated text"""
+        # Simple keyword matching for action extraction
+        action_keywords = {
+            "left": 0, "right": 1, "up": 2, "down": 3,
+            "attack": 4, "downslash": 5, "jumpattack": 6, "dashattack": 7,
+            "jump": 8, "doublejump": 9, "dash": 10, "walljump": 11,
+            "moveleftjump": 12, "moverightjump": 13, "moveleftdash": 14, "moverightdash": 15,
+            "jumpdash": 16, "downslashdash": 17
+        }
+        
+        text_lower = text.lower()
+        
+        for keyword, action_id in action_keywords.items():
+            if keyword in text_lower:
                 return action_id
-                
-        except Exception as e:
-            print(f"Error in action selection: {e}")
-            return random.randint(0, len(self.action_mapping) - 1)
+        
+        # Default action if no match found
+        return random.randint(0, self.config.action_dim - 1)
     
     def execute_action(self, action_id, controls):
         """Execute the selected action"""
-        if action_id not in self.action_mapping:
-            return False
+        action_name = self.action_mapping.get(action_id, "NoAction")
         
-        action_name = self.action_mapping[action_id]
+        # Reset all controls first
+        StopAllMovement()
         
-        try:
-            if action_name == "no_action":
-                return True
-            elif action_name == "move_left":
-                controls.MoveLeft()
-                time.sleep(0.1)
-                controls.StopMoveLeft()
-            elif action_name == "move_right":
-                controls.MoveRight()
-                time.sleep(0.1)
-                controls.StopMoveRight()
-            elif action_name == "move_up":
-                controls.MoveUp()
-                time.sleep(0.1)
-                controls.StopMoveUp()
-            elif action_name == "move_down":
-                controls.MoveDown()
-                time.sleep(0.1)
-                controls.StopMoveDown()
-            elif action_name == "jump_short":
-                controls.StartJump()
-                time.sleep(0.1)
-                controls.StopJump()
-            elif action_name == "jump_medium":
-                controls.StartJump()
-                time.sleep(0.2)
-                controls.StopJump()
-            elif action_name == "jump_long":
-                controls.StartJump()
-                time.sleep(0.4)
-                controls.StopJump()
-            elif action_name == "double_jump":
-                controls.StartJump()
-                time.sleep(0.2)
-                controls.DoubleJump()
-                time.sleep(0.2)
-                controls.StopJump()
-            elif action_name == "attack":
-                controls.Attack()
-            elif action_name == "down_slash":
-                controls.DownSlash()
-            elif action_name == "dash":
-                controls.Dash()
-            elif action_name == "dash_attack":
-                controls.DashAttack()
-            elif action_name == "jump_attack":
-                controls.JumpAttack()
-            elif action_name == "use_tool":
-                controls.UseMidTool()
-            elif action_name == "use_up_tool":
-                controls.UseUpTool()
-            elif action_name == "use_down_tool":
-                controls.UseDownTool()
-            elif action_name == "hook":
-                controls.Hook()
-            elif action_name == "bind":
-                controls.Bind()
-            elif action_name == "quick_map":
-                controls.QuickMap(duration=0.5)
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error executing action {action_name}: {e}")
-            return False
+        # Execute action based on mapping
+        if action_name == "MoveLeft":
+            controls.MoveLeft = True
+        elif action_name == "MoveRight":
+            controls.MoveRight = True
+        elif action_name == "MoveUp":
+            controls.MoveUp = True
+        elif action_name == "MoveDown":
+            controls.MoveDown = True
+        elif action_name == "Attack":
+            controls.Attack = True
+        elif action_name == "DownSlash":
+            controls.DownSlash = True
+        elif action_name == "JumpAttack":
+            controls.JumpAttack = True
+        elif action_name == "DashAttack":
+            controls.DashAttack = True
+        elif action_name == "Jump":
+            controls.Jump = True
+        elif action_name == "DoubleJump":
+            controls.DoubleJump = True
+        elif action_name == "Dash":
+            controls.Dash = True
+        elif action_name == "WallJump":
+            controls.WallJump = True
+        elif action_name == "MoveLeft+Jump":
+            controls.MoveLeft = True
+            controls.Jump = True
+        elif action_name == "MoveRight+Jump":
+            controls.MoveRight = True
+            controls.Jump = True
+        elif action_name == "MoveLeft+Dash":
+            controls.MoveLeft = True
+            controls.Dash = True
+        elif action_name == "MoveRight+Dash":
+            controls.MoveRight = True
+            controls.Dash = True
+        elif action_name == "Jump+Attack":
+            controls.Jump = True
+            controls.Attack = True
+        elif action_name == "Dash+Attack":
+            controls.Dash = True
+            controls.Attack = True
+        elif action_name == "Jump+Dash":
+            controls.Jump = True
+            controls.Dash = True
+        elif action_name == "DownSlash+Dash":
+            controls.DownSlash = True
+            controls.Dash = True
+        elif action_name == "SpecialAttack":
+            controls.SpecialAttack = True
+        
+        # Apply controls
+        GetControlState()
     
     def store_experience(self, state, action, reward, next_state, done):
         """Store experience for training"""
@@ -286,88 +285,58 @@ class OpenVLAAgent:
     def train_step(self):
         """Perform one training step"""
         if len(self.experience_buffer) < self.config.batch_size:
-            return
+            return None
         
         # Sample batch
-        batch = random.sample(list(self.experience_buffer), self.config.batch_size)
+        batch = random.sample(self.experience_buffer, self.config.batch_size)
         
-        # Prepare training data
+        # Prepare training inputs
         states = [exp['state'] for exp in batch]
         actions = [exp['action'] for exp in batch]
         rewards = [exp['reward'] for exp in batch]
+        next_states = [exp['next_state'] for exp in batch]
+        dones = [exp['done'] for exp in batch]
         
-        # Simple supervised learning: train OpenVLA to predict actions
-        try:
-            self.model.train()
-            
-            total_loss = 0
-            for i, (state, action) in enumerate(zip(states, actions)):
-                if state is None:
-                    continue
-                
-                pil_image = self.preprocess_image(state)
-                if pil_image is None:
-                    continue
-                
-                # Create training prompt
-                prompt = self.get_action_prompt("general")
-                
-                # Prepare inputs
-                inputs = self.processor(prompt, pil_image).to(
-                    self.config.device, 
-                    dtype=self.config.torch_dtype
-                )
-                
-                # Create target action (convert to continuous representation)
-                target_action = torch.tensor([action / len(self.action_mapping)], 
-                                           device=self.config.device, 
-                                           dtype=self.config.torch_dtype)
-                
-                # Forward pass
-                outputs = self.model(**inputs)
-                
-                # Simple loss: MSE between predicted and target action
-                if hasattr(outputs, 'logits'):
-                    # Use logits if available
-                    predicted_action = outputs.logits.mean(dim=-1)  # Simplified
-                    loss = nn.MSELoss()(predicted_action, target_action)
-                else:
-                    # Fallback loss
-                    loss = torch.tensor(0.1, device=self.config.device, requires_grad=True)
-                
-                # Backward pass
-                loss = loss / self.config.grad_accumulation_steps
-                loss.backward()
-                
-                total_loss += loss.item()
-            
-            # Update weights
-            if (self.step_count + 1) % self.config.grad_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                # Note: You'd need to set up an optimizer for proper training
-                # optimizer.step()
-                # optimizer.zero_grad()
-            
-            avg_loss = total_loss / len(batch)
-            
-            if self.step_count % 100 == 0:
-                print(f"Step {self.step_count}, Loss: {avg_loss:.4f}, Epsilon: {self.epsilon:.4f}")
-                
-        except Exception as e:
-            print(f"Error in training step: {e}")
+        # Convert to tensors
+        states = torch.stack(states).to(self.config.device)
+        actions = torch.tensor(actions).to(self.config.device)
+        rewards = torch.tensor(rewards).to(self.config.device)
+        next_states = torch.stack(next_states).to(self.config.device)
+        dones = torch.tensor(dones).to(self.config.device)
+        
+        # Compute loss and update model
+        # This is a simplified version - you'd need to implement proper RL loss
+        loss = self._compute_rl_loss(states, actions, rewards, next_states, dones)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient accumulation
+        if (self.step_count + 1) % self.config.grad_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # Optimizer step would go here
+        
+        return loss.item()
+    
+    def _compute_rl_loss(self, states, actions, rewards, next_states, dones):
+        """Compute RL loss (simplified version)"""
+        # This is a placeholder - implement proper RL algorithm (PPO, SAC, etc.)
+        predicted_actions = self.model(states)
+        loss = torch.nn.functional.cross_entropy(predicted_actions, actions)
+        return loss
     
     def update_epsilon(self):
         """Update exploration rate"""
-        self.epsilon = max(self.config.epsilon_end, self.epsilon * self.config.epsilon_decay)
+        self.epsilon = max(self.config.epsilon_end, 
+                          self.epsilon * self.config.epsilon_decay)
     
     def save_model(self, path):
         """Save the fine-tuned model"""
-        if self.config.use_lora:
-            self.model.save_pretrained(path)
-        else:
-            print("Warning: Full model saving not implemented without LoRA")
+        self.model.save_pretrained(path)
+        self.processor.save_pretrained(path)
+        print(f"Model saved to {path}")
 
-# Screen capture class (same as before but adapted for OpenVLA)
+# Screen capture class
 class ScreenCapture:
     def __init__(self, config):
         self.config = config
@@ -375,7 +344,7 @@ class ScreenCapture:
         self.capture_thread = None
         self.frame_buffer = deque(maxlen=2)
         self.lock = threading.Lock()
-        
+    
     def start_capture(self):
         """Start continuous screen capture"""
         if not self.is_capturing:
@@ -389,77 +358,62 @@ class ScreenCapture:
         """Stop screen capture"""
         self.is_capturing = False
         if self.capture_thread:
-            self.capture_thread.join(timeout=1.0)
+            self.capture_thread.join()
         print("Screen capture stopped")
     
     def _capture_loop(self):
         """Main capture loop"""
         while self.is_capturing:
             frame = self.capture_frame()
-            if frame is not None:
-                with self.lock:
-                    self.frame_buffer.append(frame)
-            time.sleep(self.config.frame_delay)
+            with self.lock:
+                self.frame_buffer.append(frame)
+            time.sleep(0.033)  # ~30 FPS
     
     def capture_frame(self):
         """Capture a single frame"""
         try:
-            screenshot = ImageGrab.grab(
-                bbox=(
-                    self.config.capture_x,
-                    self.config.capture_y,
-                    self.config.capture_x + self.config.capture_width,
-                    self.config.capture_y + self.config.capture_height
-                )
-            )
-            
+            # Capture screen
+            screenshot = ImageGrab.grab()
             frame = np.array(screenshot)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             
-            # Apply center crop if enabled
-            if hasattr(self.config, 'center_crop') and self.config.center_crop:
-                frame = self._center_crop(frame)
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Apply center crop
+            frame = self._center_crop(frame)
             
             return frame
-            
         except Exception as e:
             print(f"Error capturing frame: {e}")
-            return None
+            return np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
     
     def _center_crop(self, frame):
         """Apply center crop"""
-        height, width = frame.shape[:2]
-        crop_width = getattr(self.config, 'crop_width', 1920)
-        crop_height = getattr(self.config, 'crop_height', 1080)
+        h, w = frame.shape[:2]
+        crop_h = min(h, self.config.height)
+        crop_w = min(w, self.config.width)
         
-        start_x = (width - crop_width) // 2
-        start_y = (height - crop_height) // 2
-        end_x = start_x + crop_width
-        end_y = start_y + crop_height
+        start_h = (h - crop_h) // 2
+        start_w = (w - crop_w) // 2
         
-        start_x = max(0, start_x)
-        start_y = max(0, start_y)
-        end_x = min(width, end_x)
-        end_y = min(height, end_y)
-        
-        return frame[start_y:end_y, start_x:end_x]
+        return frame[start_h:start_h + crop_h, start_w:start_w + crop_w]
     
     def get_latest_frame(self):
         """Get the latest captured frame"""
         with self.lock:
             if self.frame_buffer:
                 return self.frame_buffer[-1]
-            return None
+            return np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
 
 # Main training class
-class SilksongOpenVLATrainer:
+class SilksongSmolVLATrainer:
     def __init__(self):
         self.screen_config = ScreenConfig()
-        self.vla_config = OpenVLAConfig()
+        self.vla_config = SmolVLAConfig()
         
         # Initialize components
         self.screen_capture = ScreenCapture(self.screen_config)
-        self.agent = OpenVLAAgent(self.vla_config, self.screen_config)
+        self.agent = SmolVLAAgent(self.vla_config, self.screen_config)
         
         # Initialize process detector
         self.process_detector = ProcessDetector()
@@ -475,230 +429,237 @@ class SilksongOpenVLATrainer:
         self.current_step = 0
         self.game_window_handle = None
         
+        self.FPS = 120
+        
         # Frame stack for temporal information
         self.frame_stack = deque(maxlen=4)
+        
+        # HP tracking for damage-based rewards
+        self.last_player_hp = None
+        self.last_boss_hp = None
+        
+        # Survival bonus tracking
+        self.survival_start_time = None
+        self.last_survival_bonus_time = None
+        self.survival_bonus_interval = 5.0  # 5 seconds
     
     def start_training(self):
-        """Start the OpenVLA training process"""
-        print("Starting Silksong OpenVLA training...")
+        """Start the SmolVLA training process"""
+        if self.is_training:
+            print("Training already in progress")
+            return
         
-        # Check if Silksong is running
-        print("Checking if Silksong is running...")
-        is_ready, window_handle = self.process_detector.is_game_ready()
-        
-        if not is_ready:
-            print(f"Silksong is not ready. Waiting for game to start (timeout: {self.vla_config.game_wait_timeout}s)...")
-            is_ready, window_handle = self.process_detector.wait_for_game(self.vla_config.game_wait_timeout)
-            
-            if not is_ready:
-                print("ERROR: Silksong is not running or not focused. Please start the game and try again.")
-                print("Game info:")
-                info = self.process_detector.get_game_info()
-                for key, value in info.items():
-                    print(f"  {key}: {value}")
-                return False
-        
-        print("Silksong is ready! Starting training...")
-        self.game_window_handle = window_handle
         self.is_training = True
+        self.current_episode = 0
+        self.current_step = 0
         
         # Start screen capture
         self.screen_capture.start_capture()
         
-        # Wait for capture to initialize
-        time.sleep(1.0)
+        # Start training thread
+        training_thread = threading.Thread(target=self._training_loop)
+        training_thread.daemon = True
+        training_thread.start()
         
-        # Initialize frame stack
-        self._initialize_frame_stack()
-        
-        # Start training loop
-        self._training_loop()
+        print("SmolVLA training started!")
     
     def stop_training(self):
         """Stop training"""
         self.is_training = False
         self.screen_capture.stop_capture()
-        self.controls.Cleanup()
-        
-        # Save model
-        self.agent.save_model("silksong_openvla_finetuned")
-        print("Training stopped and model saved")
-
+        print("Training stopped")
+    
     def _initialize_frame_stack(self):
         """Initialize frame stack with current frames"""
+        self.frame_stack.clear()
         for _ in range(4):
             frame = self.screen_capture.get_latest_frame()
-            if frame is not None:
-                self.frame_stack.append(frame)
-            time.sleep(0.1)
-
+            self.frame_stack.append(frame)
+    
     def _check_game_status(self):
         """Check if game is still running and focused"""
-        is_ready, window_handle = self.process_detector.is_game_ready()
+        if not self.process_detector.is_silksong_running():
+            print("Silksong process not found")
+            return False
         
-        if not is_ready:
-            print("WARNING: Silksong is no longer ready (not running or not focused)")
-            
-            if self.vla_config.auto_restart_training:
-                print("Attempting to handle game disconnection...")
-                return self._handle_game_not_running()
-            else:
-                print("Stopping training...")
-                self.is_training = False
+        if self.vla_config.require_game_focus:
+            if not self.process_detector.is_game_focused():
+                print("Game window not focused")
                 return False
         
         return True
     
     def _handle_game_not_running(self):
         """Handle fallback behavior when game is not running"""
-        print("Game is not running. Executing fallback behavior...")
+        print("Game not running or not focused. Waiting...")
         
-        # Stop all current actions
-        self.controls.StopAllMovement()
-        
-        # Wait and periodically check if game comes back
-        wait_time = 0
-        max_wait_time = self.vla_config.game_wait_timeout
-        
-        while wait_time < max_wait_time and self.is_training:
-            print(f"Waiting for game... ({wait_time:.1f}s / {max_wait_time}s)")
+        if self.vla_config.auto_restart_training:
+            # Wait for game to start
+            start_time = time.time()
+            while time.time() - start_time < self.vla_config.game_wait_timeout:
+                if self._check_game_status():
+                    print("Game detected! Resuming training...")
+                    return True
+                time.sleep(self.vla_config.game_check_interval)
             
-            # Check if game is ready
-            is_ready, window_handle = self.process_detector.is_game_ready()
-            if is_ready:
-                print("Game is back! Resuming training.")
-                self.game_window_handle = window_handle
-                return True
-            
-            # Sleep for a short interval
-            time.sleep(2.0)
-            wait_time += 2.0
+            print("Game wait timeout reached. Stopping training.")
+            return False
         
-        print("Game did not return within timeout. Stopping training.")
-        self.is_training = False
         return False
-
+    
     def _training_loop(self):
         """Main training loop"""
+        print("Starting training loop...")
+        
+        # Initialize frame stack
+        self._initialize_frame_stack()
+        
         while self.is_training and self.current_episode < self.vla_config.max_episodes:
-            try:
-                print(f"Starting Episode {self.current_episode + 1}")
-
-                # Reset episode state
-                episode_reward = 0
-                self.current_step = 0
+            # Check game status
+            if not self._check_game_status():
+                if not self._handle_game_not_running():
+                    break
+                continue
+            
+            # Start new episode
+            self.current_episode += 1
+            self.current_step = 0
+            episode_reward = 0
+            
+            # Reset survival timer and HP tracking for new episode
+            self.survival_start_time = None
+            self.last_survival_bonus_time = None
+            self.last_player_hp = None
+            self.last_boss_hp = None
+            
+            print(f"Starting episode {self.current_episode}")
+            
+            # Episode loop
+            while (self.is_training and 
+                   self.current_step < self.vla_config.max_steps_per_episode):
                 
-                # Initialize frame stack for new episode
-                self.frame_stack.clear()
-                self._initialize_frame_stack()
+                # Get current frame
+                current_frame = self.screen_capture.get_latest_frame()
                 
-                while (self.is_training and 
-                       self.current_step < self.vla_config.max_steps_per_episode):
-                    
-                    # Check game status periodically
-                    if self.current_step % int(self.vla_config.game_check_interval / self.vla_config.action_delay) == 0:
-                        if not self._check_game_status():
-                            break
-                    
-                    # Get current state
-                    current_frame = self.screen_capture.get_latest_frame()
-                    if current_frame is None:
-                        time.sleep(0.1)
-                        continue
-                    
-                    # Determine scenario (simple heuristic based on frame content)
-                    scenario = self._determine_scenario(current_frame)
-                    
-                    # Select action using OpenVLA
-                    action_id = self.agent.select_action(current_frame, scenario)
-                    
-                    # Execute action
-                    success = self.agent.execute_action(action_id, self.controls)
-                    
-                    # Get reward
-                    reward = self._get_reward(success, current_frame)
-                    episode_reward += reward
-                    
-                    # Get next state
-                    next_frame = self.screen_capture.get_latest_frame()
-                    
-                    # Check if episode is done
-                    done = self._is_episode_done()
-                    
-                    # Store experience
-                    self.agent.store_experience(
-                        current_frame, action_id, reward, next_frame, done
-                    )
-                    
-                    # Train agent
-                    self.agent.train_step()
-                    
-                    # Update counters
-                    self.current_step += 1
+                # Determine scenario
+                scenario = self._determine_scenario(current_frame)
+                
+                # Select action
+                action_id = self.agent.select_action(current_frame, scenario)
+                
+                # Execute action
+                self.agent.execute_action(action_id, self.controls)
+                
+                # Get reward
+                reward = self._get_reward(True, current_frame)
+                episode_reward += reward
+                
+                # Get next frame
+                next_frame = self.screen_capture.get_latest_frame()
+                
+                # Store experience
+                self.agent.store_experience(current_frame, action_id, reward, next_frame, False)
+                
+                # Training step
+                loss = self.agent.train_step()
+                if loss is not None:
                     self.agent.step_count += 1
-                    
-                    # Update exploration rate
-                    self.agent.update_epsilon()
-                    
-                    # Small delay
-                    time.sleep(0.05)
                 
-                # Episode complete
-                print(f"Episode {self.current_episode + 1} completed. "
-                      f"Reward: {episode_reward:.2f}, Steps: {self.current_step}")
+                # Update exploration rate
+                self.agent.update_epsilon()
                 
-                self.current_episode += 1
+                # Check if episode is done
+                if self._is_episode_done():
+                    break
                 
-                # Reset game state
-                self.controls.ResetJumpState()
-                time.sleep(1.0)  # Brief pause between episodes
+                self.current_step += 1
                 
-            except KeyboardInterrupt:
-                print("Training interrupted by user")
-                break
-            except Exception as e:
-                print(f"Error in training loop: {e}")
-                time.sleep(1.0)
+                # Small delay to prevent overwhelming the system
+                time.sleep(1 / self.FPS)  # 1 / FPS
+            
+            print(f"Episode {self.current_episode} completed. Reward: {episode_reward:.2f}")
+            
+            # Save model periodically
+            if self.current_episode % 10 == 0:
+                self.agent.save_model(f"smolvla_checkpoint_episode_{self.current_episode}")
     
     def _determine_scenario(self, frame):
         """Determine current game scenario based on frame content"""
-        # Simple heuristic - can be improved with computer vision
-        # For now, return general scenario
+        # Simple heuristic - in practice, you'd use more sophisticated detection
+        # For now, default to general
         return "general"
     
     def _get_reward(self, success, frame):
-        """Get reward for current action"""
-        if not success:
-            return -0.5
+        """Get reward for current action with damage tracking and survival bonuses"""
+        reward = 0.0
         
-        # Simple reward function
-        base_reward = 0.1
+        # Base reward for successful action
+        if success:
+            reward += 0.1
+        else:
+            reward -= 0.05
         
-        # Can add more sophisticated reward shaping here
-        # For example: detect enemies, platforms, collectibles, etc.
+        # Get current game state to track damage
+        current_state = GetControlState()
         
-        return base_reward
+        # Track damage taken (negative reward)
+        if hasattr(current_state, 'player_hp') and hasattr(self, 'last_player_hp'):
+            damage_taken = self.last_player_hp - current_state.player_hp
+            if damage_taken > 0:
+                reward -= damage_taken  # Penalty for damage taken
+                print(f"Damage taken: {damage_taken}, penalty: {-damage_taken}")
+        
+        # Track damage dealt (positive reward)
+        if hasattr(current_state, 'boss_hp') and hasattr(self, 'last_boss_hp'):
+            damage_dealt = self.last_boss_hp - current_state.boss_hp
+            if damage_dealt > 0:
+                reward += damage_dealt / 10.0  # Reward for damage dealt
+                print(f"Damage dealt: {damage_dealt}, reward: {damage_dealt / 10.0}")
+        
+        # Update last known HP values
+        if hasattr(current_state, 'player_hp'):
+            self.last_player_hp = current_state.player_hp
+        if hasattr(current_state, 'boss_hp'):
+            self.last_boss_hp = current_state.boss_hp
+        
+        # Survival bonus: +0.1 for every 5 seconds survived
+        current_time = time.time()
+        if self.survival_start_time is None:
+            self.survival_start_time = current_time
+            self.last_survival_bonus_time = current_time
+        
+        # Check if it's time for survival bonus
+        if current_time - self.last_survival_bonus_time >= self.survival_bonus_interval:
+            reward += 0.1
+            self.last_survival_bonus_time = current_time
+            print(f"Survival bonus: +0.1 (survived {current_time - self.survival_start_time:.1f}s)")
+        
+        return reward
     
     def _is_episode_done(self):
         """Check if current episode should end"""
-        # Simple episode termination conditions
-        if self.current_step >= self.vla_config.max_steps_per_episode:
-            return True
-        
-        # Can add more conditions like:
-        # - Character death
-        # - Level completion
-        # - Timeout
-        
-        return False
+        # Simple termination condition
+        return self.current_step >= self.vla_config.max_steps_per_episode
 
 # Main execution
 if __name__ == "__main__":
-    trainer = SilksongOpenVLATrainer()
+    trainer = SilksongSmolVLATrainer()
     
     try:
+        print("Starting Silksong SmolVLA training...")
+        print("Make sure Silksong is running and the game window is focused.")
+        
         trainer.start_training()
-    except KeyboardInterrupt:
-        print("Training stopped by user")
+        
+        # Keep the main thread alive
+        while trainer.is_training:
+            time.sleep(1)
+            
+    except KeyboardInterrupt or pyautogui.keyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"Training error: {e}")
     finally:
         trainer.stop_training()
+        Cleanup()
+        print("Training completed")
